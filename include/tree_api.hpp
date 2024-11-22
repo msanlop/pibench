@@ -51,6 +51,9 @@ public:
         return false;
     }
 
+    virtual void thread_timers_start(void) {};
+    virtual void thread_timers_stop(void) {};
+
     /**
      * @brief Lookup record with given key.
      * 

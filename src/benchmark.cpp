@@ -465,7 +465,7 @@ void benchmark_t::run() noexcept
                 uint32_t epoch_ops_threshold_count = 0;
                 epoch_.enterEpoche(t);
 #endif
-
+                tree_->thread_timers_start();
                 if (opt_.bm_mode == mode_t::Operation)
                 {
                     #pragma omp for schedule(static)
@@ -496,6 +496,7 @@ void benchmark_t::run() noexcept
 #endif
                     }
                     while (!finished);
+                    tree_->thread_timers_stop();
                 }
 
 #if defined(EPOCH_BASED_RECLAMATION)

@@ -132,6 +132,9 @@ public:
     virtual int scan(const char* key, size_t key_sz, int scan_sz, char*& values_out) = 0;
 
     virtual void tls_setup() {};
+
+    virtual void thread_start(int thread_id) {};
+
 };
 
 #endif

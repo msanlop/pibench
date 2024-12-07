@@ -25,6 +25,7 @@ struct tree_options_t
     std::string pool_path = "";
     size_t pool_size = 0;
     size_t num_threads = 1;
+    void *data;
 };
 
 class tree_api;
@@ -34,6 +35,24 @@ class tree_api
 {
 public:
     virtual ~tree_api(){};
+
+    /**
+     * @brief Bulk loading given keys and values.
+     * 
+     * @param data Pointer to array of key-value pairs.
+     * @param num_records Number of key-value pairs.
+     * @param key_sz Size of key in bytes.
+     * @param value_sz Size of value in bytes.
+     * @return true if bulk loading was successful
+     * @return false if bulk loading failed
+     */
+    virtual bool bulk_load(const char* data, size_t num_records, size_t key_sz, size_t value_sz)
+    {
+        return false;
+    }
+
+    virtual void thread_timers_start(void) {};
+    virtual void thread_timers_stop(void) {};
 
     /**
      * @brief Lookup record with given key.
@@ -111,6 +130,8 @@ public:
      * return scanned;
      */
     virtual int scan(const char* key, size_t key_sz, int scan_sz, char*& values_out) = 0;
+
+    virtual void tls_setup() {};
 };
 
 #endif

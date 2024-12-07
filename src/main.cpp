@@ -2,6 +2,7 @@
 #include "benchmark.hpp"
 #include "library_loader.hpp"
 #include "cxxopts.hpp"
+#include "sched.hpp"
 
 #include <iostream>
 #include <algorithm>
@@ -14,6 +15,11 @@ using namespace PiBench;
 
 int main(int argc, char** argv)
 {
+    if (!DetectCPUCores()) {
+        std::cerr << "Error: Failed to detect CPU topology" << std::endl;
+        return -1;
+    }
+
     // Parse command line arguments
     options_t opt;
     tree_options_t tree_opt;
@@ -45,10 +51,17 @@ int main(int argc, char** argv)
             ("pcm", "Turn on Intel PCM", cxxopts::value<bool>()->default_value((opt.enable_pcm ? "true" : "false")))
             ("pool_path", "Path to persistent pool", cxxopts::value<std::string>()->default_value("\"" + tree_opt.pool_path + "\""))
             ("pool_size", "Size of persistent pool (in Bytes)", cxxopts::value<uint64_t>()->default_value(std::to_string(tree_opt.pool_size)))
+            ("bulk_load", "Use bulk loading", cxxopts::value<bool>()->default_value((opt.bulk_load ? "true" : "false")))
             ("skip_load", "Skip the load phase", cxxopts::value<bool>()->default_value((opt.skip_load ? "true" : "false")))
+            ("skip_verify", "Skip the verify phase", cxxopts::value<bool>()->default_value((opt.skip_verify ? "true" : "false")))
+            ("apply_hash", "Apply the multiplicative hash function", cxxopts::value<bool>()->default_value((opt.apply_hash ? "true" : "false")))
             ("latency_sampling", "Sample latency of requests", cxxopts::value<float>()->default_value(std::to_string(opt.latency_sampling)))
             ("m,mode","Benchmark mode",cxxopts::value<std::string>()->default_value("operation"))
             ("seconds","Time (seconds) PiBench run in time-based mode",cxxopts::value<float>()->default_value(std::to_string(opt.seconds)))
+            ("epoch_ops_threshold","Number of operations before exiting/re-entering epochs",cxxopts::value<uint32_t>()->default_value(std::to_string(opt.epoch_ops_threshold)))
+            ("epoch_gc_threshold","Number of deletions before performing garbage collection",cxxopts::value<uint32_t>()->default_value(std::to_string(opt.epoch_gc_threshold)))
+            ("enable_perf", "Enable perf", cxxopts::value<bool>()->default_value((opt.enable_perf ? "true" : "false")))
+            ("perf_record_args", "Arguments to perf-record", cxxopts::value<std::string>()->default_value(""))
             ("help", "Print help")
         ;
 
@@ -66,9 +79,24 @@ int main(int argc, char** argv)
             opt.enable_pcm = result["pcm"].as<bool>();
         }
 
+        if (result.count("bulk_load"))
+        {
+            opt.bulk_load = result["bulk_load"].as<bool>();
+        }
+
         if (result.count("skip_load"))
         {
             opt.skip_load = result["skip_load"].as<bool>();
+        }
+
+        if (result.count("skip_verify"))
+        {
+            opt.skip_verify = result["skip_verify"].as<bool>();
+        }
+
+        if (result.count("apply_hash"))
+        {
+            opt.apply_hash = result["apply_hash"].as<bool>();
         }
 
         if (result.count("latency_sampling"))
@@ -147,10 +175,12 @@ int main(int argc, char** argv)
                     << std::endl;
                 opt.key_distribution = distribution_t::ZIPFIAN;
             }
+            else if(dist.compare("rdtsc") == 0)
+                opt.key_distribution = distribution_t::RDTSC;
             else
             {
                 std::cout << "Invalid key distribution, must be one of "
-                << "[UNIFORM | SELFSIMILAR | ZIPFIAN], but is " << dist << std::endl;
+                << "[UNIFORM | SELFSIMILAR | ZIPFIAN | RDTSC], but is " << dist << std::endl;
                 exit(1);
             }
         }
@@ -212,6 +242,26 @@ int main(int argc, char** argv)
         // Parse "seconds"
         if (result.count("seconds"))
             opt.seconds = result["seconds"].as<float>();
+
+        // Parse "epoch_ops_threshold"
+        if (result.count("epoch_ops_threshold"))
+            opt.epoch_ops_threshold = result["epoch_ops_threshold"].as<uint32_t>();
+
+        // Parse "epoch_gc_threshold"
+        if (result.count("epoch_gc_threshold"))
+            opt.epoch_gc_threshold = result["epoch_gc_threshold"].as<uint32_t>();
+
+        // Parse "enable_perf"
+        if (result.count("enable_perf"))
+        {
+            opt.enable_perf = result["enable_perf"].as<bool>();
+        }
+
+        // Parse "perf_record_args"
+        if (result.count("perf_record_args"))
+        {
+            opt.perf_record_args = result["perf_record_args"].as<std::string>();
+        }
     }
     catch (const cxxopts::OptionException& e)
     {
@@ -260,9 +310,27 @@ int main(int argc, char** argv)
         exit(1);
     }
 
+    if(opt.key_distribution == distribution_t::RDTSC && opt.apply_hash)
+    {
+        std::cout << "Multiplicative hash function should not be applied with RDTSC." << std::endl;
+        exit(1);
+    }
+
+    if(opt.key_distribution == distribution_t::RDTSC && !opt.skip_verify)
+    {
+        std::cout << "Verify phase should be skipped with RDTSC." << std::endl;
+        exit(1);
+    }
+
     if((opt.latency_sampling < 0.0 || opt.latency_sampling > 1.0))
     {
         std::cout << "Latency sampling must be in the range [0.0 , 1.0]." << std::endl;
+        exit(1);
+    }
+
+    if(!opt.enable_perf && opt.perf_record_args != "")
+    {
+        std::cout << "Error: perf is disabled but perf_record_args is not empty" << std::endl;
         exit(1);
     }
 
@@ -275,6 +343,11 @@ int main(int argc, char** argv)
     tree_opt.num_threads = opt.num_threads;
 
     library_loader_t lib(opt.library_file);
+
+#if defined(EPOCH_BASED_RECLAMATION)
+    benchmark_t bench(nullptr, opt);
+    tree_opt.data = reinterpret_cast<void *>(&bench.getEpoch());
+#endif
     tree_api* tree = lib.create_tree(tree_opt);
     if(tree == nullptr)
     {
@@ -282,7 +355,11 @@ int main(int argc, char** argv)
         exit(1);
     }
 
+#if defined(EPOCH_BASED_RECLAMATION)
+    bench.setTree(tree);
+#else
     benchmark_t bench(tree, opt);
+#endif
     bench.load();
     bench.run();
 

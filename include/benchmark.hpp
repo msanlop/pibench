@@ -13,6 +13,10 @@
 #include <chrono> // std::chrono::high_resolution_clock::time_point
 #include <vector>
 
+#if defined(EPOCH_BASED_RECLAMATION)
+#include "third_party/art_ebr/Epoche.h"
+#endif
+
 namespace PiBench
 {
 
@@ -35,7 +39,8 @@ enum class distribution_t : uint8_t
 {
     UNIFORM = 0,
     SELFSIMILAR = 1,
-    ZIPFIAN = 2
+    ZIPFIAN = 2,
+    RDTSC = 3
 };
 
 /**
@@ -98,8 +103,17 @@ struct options_t
     /// Whether to enable Intel PCM for profiling.
     bool enable_pcm = true;
 
+    /// Whether to do bulk loading.
+    bool bulk_load = false;
+
     /// Whether to skip the load phase.
     bool skip_load = false;
+
+    /// Whether to skip the verify phase.
+    bool skip_verify = false;
+
+    /// Whether to apply the multiplicative hash function.
+    bool apply_hash = true;
 
     /// Ratio of requests to sample latency from (between 0.0 and 1.0).
     float latency_sampling = 0.0;
@@ -109,6 +123,18 @@ struct options_t
 
     /// Experiment mode
     mode_t bm_mode = mode_t::Operation;
+
+    /// Number of operations before exiting/re-entering epochs
+    uint32_t epoch_ops_threshold = 1024;
+
+    /// Number of deletions before performing garbage collection
+    uint32_t epoch_gc_threshold = 256;
+
+    /// Whether to use perf for profiling.
+    bool enable_perf = false;
+
+    /// Arguments to perf-record
+    std::string perf_record_args = "";
 };
 
 /**
@@ -223,6 +249,18 @@ private:
 
     /// Intel PCM handler.
     PCM* pcm_;
+
+#if defined(EPOCH_BASED_RECLAMATION)
+    /// Epoch manager
+    ART::Epoche epoch_;
+
+public:
+    ART::Epoche& getEpoch() { return epoch_; }
+
+    void setTree(tree_api *tree) { tree_ = tree; }
+
+private:
+#endif
 };
 } // namespace PiBench
 

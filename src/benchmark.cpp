@@ -1,16 +1,20 @@
 #include "benchmark.hpp"
 #include "utils.hpp"
+#include "sched.hpp"
+#include "third_party/foedus/bernoulli_random.hpp"
 
 #include <algorithm>
 #include <cassert>
 #include <iostream>
 #include <omp.h>
 #include <functional> // std::bind
+#include <iterator>
 #include <cmath>      // std::ceil
 #include <ctime>
 #include <fstream>
 #include <regex>            // std::regex_replace
 #include <sys/utsname.h>    // uname
+#include <sys/wait.h>       // waitpid
 
 namespace PiBench
 {
@@ -82,6 +86,9 @@ benchmark_t::benchmark_t(tree_api* tree, const options_t& opt) noexcept
       op_generator_(opt.read_ratio, opt.insert_ratio, opt.update_ratio, opt.remove_ratio, opt.scan_ratio),
       value_generator_(opt.value_size),
       pcm_(nullptr)
+#if defined(EPOCH_BASED_RECLAMATION)
+      , epoch_(opt.epoch_gc_threshold)
+#endif
 {
     if (opt.enable_pcm)
     {
@@ -101,15 +108,19 @@ benchmark_t::benchmark_t(tree_api* tree, const options_t& opt) noexcept
     switch (opt_.key_distribution)
     {
     case distribution_t::UNIFORM:
-        key_generator_ = std::make_unique<uniform_key_generator_t>(key_space_sz, opt_.key_size, opt_.key_prefix);
+        key_generator_ = std::make_unique<uniform_key_generator_t>(key_space_sz, opt_.key_size, opt_.apply_hash, opt_.key_prefix);
         break;
 
     case distribution_t::SELFSIMILAR:
-        key_generator_ = std::make_unique<selfsimilar_key_generator_t>(key_space_sz, opt_.key_size, opt_.key_prefix, opt_.key_skew);
+        key_generator_ = std::make_unique<selfsimilar_key_generator_t>(key_space_sz, opt_.key_size, opt_.apply_hash, opt_.key_prefix, opt_.key_skew);
         break;
 
     case distribution_t::ZIPFIAN:
-        key_generator_ = std::make_unique<zipfian_key_generator_t>(key_space_sz, opt_.key_size, opt_.key_prefix, opt_.key_skew);
+        key_generator_ = std::make_unique<zipfian_key_generator_t>(key_space_sz, opt_.key_size, opt_.apply_hash, opt_.key_prefix, opt_.key_skew);
+        break;
+
+    case distribution_t::RDTSC:
+        key_generator_ = std::make_unique<rdtsc_key_generator_t>(key_space_sz, opt_.key_size, opt_.apply_hash, opt_.key_prefix);
         break;
 
     default:
@@ -137,12 +148,63 @@ void benchmark_t::load() noexcept
     stopwatch_t sw;
     sw.start();
 
+    if (opt_.bulk_load)
+    {
+        std::cout << "Bulk loading..." << std::endl;
+        tree_->tls_setup();
+#if defined(EPOCH_BASED_RECLAMATION)
+        ART::ThreadInfo t(epoch_);
+        uint32_t epoch_ops_threshold_count = 0;
+        epoch_.enterEpoche(t);
+#endif
+
+        size_t num_bytes = opt_.num_records * (key_generator_->size() + opt_.value_size);
+        char *kv_pairs = (char *)aligned_alloc(64, num_bytes);
+        char *pos = kv_pairs;
+
+        key_generator_->current_id_ = opt_.num_records / opt_.num_threads * omp_get_thread_num();
+        for (uint64_t i = 0; i < opt_.num_records; ++i)
+        {
+            // Generate key in sequence
+            auto key_ptr = key_generator_->next(true);
+
+            // Generate random value
+            auto value_ptr = value_generator_.next();
+
+            memcpy(pos, key_ptr, key_generator_->size());
+            pos += key_generator_->size();
+
+            memcpy(pos, value_ptr, opt_.value_size);
+            pos += opt_.value_size;
+        }
+
+        auto r = tree_->bulk_load(kv_pairs, opt_.num_records, key_generator_->size(), opt_.value_size);
+        free(kv_pairs);
+
+        if (!r)
+        {
+            std::cout << "Bulk loading failed!" << std::endl;
+            exit(1);
+        }
+
+#if defined(EPOCH_BASED_RECLAMATION)
+        epoch_.exitEpocheAndCleanup(t);
+#endif
+    }
+    else
     {
         #pragma omp parallel num_threads(opt_.num_threads)
         {
+            set_affinity(omp_get_thread_num());
             // Initialize insert id for each thread
             key_generator_->current_id_ = opt_.num_records / opt_.num_threads * omp_get_thread_num();
 
+            tree_->tls_setup();
+#if defined(EPOCH_BASED_RECLAMATION)
+            ART::ThreadInfo t(epoch_);
+            uint32_t epoch_ops_threshold_count = 0;
+            epoch_.enterEpoche(t);
+#endif
             #pragma omp for schedule(static)
             for (uint64_t i = 0; i < opt_.num_records; ++i)
             {
@@ -154,7 +216,18 @@ void benchmark_t::load() noexcept
 
                 auto r = tree_->insert(key_ptr, key_generator_->size(), value_ptr, opt_.value_size);
                 assert(r);
+
+#if defined(EPOCH_BASED_RECLAMATION)
+                if (++epoch_ops_threshold_count == opt_.epoch_ops_threshold) {
+                    epoch_.exitEpocheAndCleanup(t);
+                    epoch_.enterEpoche(t);
+                    epoch_ops_threshold_count = 0;
+                }
+#endif
             }
+#if defined(EPOCH_BASED_RECLAMATION)
+            epoch_.exitEpocheAndCleanup(t);
+#endif
         }
 
     }
@@ -163,13 +236,21 @@ void benchmark_t::load() noexcept
 
     std::cout << "Loading finished in " << elapsed << " milliseconds" << std::endl;
 
+    if (opt_.skip_verify)
+    {
+        std::cout << "Verification skipped; benchmark started." << std::endl;
+        return;
+    }
+
     // Verify all keys can be found
     {
         #pragma omp parallel num_threads(opt_.num_threads)
         {
+            set_affinity(omp_get_thread_num());
             // Initialize insert id for each thread
             auto id = opt_.num_records / opt_.num_threads * omp_get_thread_num();
 
+            tree_->tls_setup();
             #pragma omp for schedule(static)
             for (uint64_t i = 0; i < opt_.num_records; ++i)
             {
@@ -179,6 +260,7 @@ void benchmark_t::load() noexcept
                 static thread_local char value_out[value_generator_t::VALUE_MAX];
                 bool found = tree_->find(key_ptr, key_generator_->size(), value_out);
                 if (!found) {
+                    std::cout << "Error: missing key!" << std::endl;
                     exit(1);
                 }
             }
@@ -219,6 +301,54 @@ void benchmark_t::run() noexcept
 
     // Current id after load
     uint64_t current_id = key_generator_->current_id_;
+
+    pid_t perf_pid;
+    if (opt_.enable_perf)
+    {
+        std::cout << "Starting perf..." << std::endl;
+
+        std::stringstream parent_pid;
+        parent_pid << getpid();
+
+        pid_t pid = fork();
+        // Launch profiler
+        if (pid == 0)
+        {
+            if (opt_.perf_record_args == "")
+            {
+                exit(execl("/usr/bin/perf", "perf", "record", "--call-graph", "dwarf", "-e", "cycles", "-p",
+                        parent_pid.str().c_str(), nullptr));
+            }
+            else
+            {
+                std::vector<char *> argv;
+                argv.push_back((char *)"perf");
+                argv.push_back((char *)"record");
+
+                std::string parent_pid_str = parent_pid.str();
+                argv.push_back((char *)"-p");
+                argv.push_back(const_cast<char *>(parent_pid_str.c_str()));
+
+                // Ref: https://stackoverflow.com/a/5607650
+                std::stringstream ss(opt_.perf_record_args);
+                std::istream_iterator<std::string> begin(ss);
+                std::istream_iterator<std::string> end;
+                std::vector<std::string> args(begin, end);
+                for (auto &s : args)
+                {
+                    argv.push_back(const_cast<char *>(s.c_str()));
+                }
+
+                // Ref: https://stackoverflow.com/a/35247904
+                argv.push_back(nullptr);
+                exit(execv("/usr/bin/perf", argv.data()));
+            }
+        }
+        else
+        {
+            perf_pid = pid;
+        }
+    }
 
     std::unique_ptr<SystemCounterState> before_sstate;
     if (opt_.enable_pcm)
@@ -270,6 +400,9 @@ void benchmark_t::run() noexcept
             #pragma omp parallel num_threads(opt_.num_threads)
             {
                 auto tid = omp_get_thread_num();
+                set_affinity(tid);
+
+                tree_->tls_setup();
 
                 // Initialize random seed for each thread
                 key_generator_->set_seed(opt_.rnd_seed * (tid + 1));
@@ -277,7 +410,8 @@ void benchmark_t::run() noexcept
                 // Initialize insert id for each thread
                 key_generator_->current_id_ = current_id + (inserts_per_thread * tid);
 
-                auto random_bool = std::bind(std::bernoulli_distribution(opt_.latency_sampling), std::knuth_b());
+                foedus::assorted::BernoulliRandom random_bool(opt_.latency_sampling,
+                                                              opt_.rnd_seed * (tid + 1));
 
                 #pragma omp barrier
 
@@ -312,7 +446,7 @@ void benchmark_t::run() noexcept
                         key_ptr = key_generator_->hash_id(id);
                     }
 
-                    auto measure_latency = random_bool();
+                    auto measure_latency = random_bool.next();
                     if (measure_latency)
                     {
                         local_stats[tid].times.push_back(std::chrono::high_resolution_clock::now());
@@ -326,12 +460,25 @@ void benchmark_t::run() noexcept
                     }
                 };
 
+#if defined(EPOCH_BASED_RECLAMATION)
+                ART::ThreadInfo t(epoch_);
+                uint32_t epoch_ops_threshold_count = 0;
+                epoch_.enterEpoche(t);
+#endif
+                tree_->thread_timers_start();
                 if (opt_.bm_mode == mode_t::Operation)
                 {
                     #pragma omp for schedule(static)
                     for (uint64_t i = 0; i < opt_.num_ops; ++i)
                     {
                         execute_op();
+#if defined(EPOCH_BASED_RECLAMATION)
+                        if (++epoch_ops_threshold_count == opt_.epoch_ops_threshold) {
+                            epoch_.exitEpocheAndCleanup(t);
+                            epoch_.enterEpoche(t);
+                            epoch_ops_threshold_count = 0;
+                        }
+#endif
                     }
                 }
                 else
@@ -340,9 +487,21 @@ void benchmark_t::run() noexcept
                     do
                     {
                         execute_op();
+#if defined(EPOCH_BASED_RECLAMATION)
+                        if (++epoch_ops_threshold_count == opt_.epoch_ops_threshold) {
+                            epoch_.exitEpocheAndCleanup(t);
+                            epoch_.enterEpoche(t);
+                            epoch_ops_threshold_count = 0;
+                        }
+#endif
                     }
                     while (!finished);
+                    tree_->thread_timers_stop();
                 }
+
+#if defined(EPOCH_BASED_RECLAMATION)
+                epoch_.exitEpocheAndCleanup(t);
+#endif
 
                 // Get elapsed time and signal monitor thread to finish.
                 #pragma omp single nowait
@@ -354,6 +513,13 @@ void benchmark_t::run() noexcept
         }
     }
     omp_set_nested(false);
+
+    if (opt_.enable_perf)
+    {
+        std::cout << "Stopping perf..." << std::endl;
+        kill(perf_pid, SIGINT);
+        waitpid(perf_pid, nullptr, 0);
+    }
 
     std::unique_ptr<SystemCounterState> after_sstate;
     if (opt_.enable_pcm)
@@ -453,6 +619,23 @@ void benchmark_t::run() noexcept
               << "\t- Scan completed: " << total_scan / ((double)elapsed / 1000) << " ops/s\n"
               << "\t- Scan succeeded: " << total_success_scan/ ((double)elapsed / 1000) << " ops/s"
               << std::endl;
+
+    std::cout << "Per-thread breakdown (insert/read/update/remove/scan):\n";
+    for (auto &s : local_stats) {
+      std::cout << "\t" << s.insert_count << "/" 
+                << s.read_count << "/" 
+                << s.update_count << "/" 
+                << s.remove_count << "/" 
+                << s.scan_count << " completed" << std::endl;
+    }
+
+    for (auto &s : local_stats) {
+      std::cout << "\t" << s.success_insert_count << "/" 
+                << s.success_read_count << "/" 
+                << s.success_update_count << "/" 
+                << s.success_remove_count << "/" 
+                << s.success_scan_count << " succeeded" << std::endl;
+    }
 
     if (opt_.enable_pcm)
     {
@@ -586,6 +769,9 @@ std::ostream& operator<<(std::ostream& os, const PiBench::distribution_t& dist)
         break;
     case PiBench::distribution_t::ZIPFIAN:
         return os << "ZIPFIAN";
+        break;
+    case PiBench::distribution_t::RDTSC:
+        return os << "RDTSC";
         break;
     default:
         return os << static_cast<uint8_t>(dist);

@@ -197,11 +197,12 @@ void benchmark_t::load() noexcept
         {
             int thread_num = omp_get_thread_num();
             set_affinity(thread_num);
+            tree_->tls_setup();
+            
             tree_->thread_start(thread_num);
             // Initialize insert id for each thread
             key_generator_->current_id_ = opt_.num_records / opt_.num_threads * thread_num;
 
-            tree_->tls_setup();
 #if defined(EPOCH_BASED_RECLAMATION)
             ART::ThreadInfo t(epoch_);
             uint32_t epoch_ops_threshold_count = 0;
@@ -235,7 +236,7 @@ void benchmark_t::load() noexcept
     }
 
     auto elapsed = sw.elapsed<std::chrono::milliseconds>();
-
+    tree_->tls_reset();
     std::cout << "Loading finished in " << elapsed << " milliseconds" << std::endl;
 
     if (opt_.skip_verify)
@@ -250,11 +251,11 @@ void benchmark_t::load() noexcept
         {
             int thread_num = omp_get_thread_num();
             set_affinity(thread_num);
+            tree_->tls_setup();
             tree_->thread_start(thread_num);
             // Initialize insert id for each thread
             auto id = opt_.num_records / opt_.num_threads * thread_num;
 
-            tree_->tls_setup();
             #pragma omp for schedule(static)
             for (uint64_t i = 0; i < opt_.num_records; ++i)
             {
@@ -271,6 +272,7 @@ void benchmark_t::load() noexcept
         }
     }
 
+    tree_->tls_reset();
     std::cout << "Load verified; benchmark started." << std::endl;
 }
 
@@ -626,22 +628,22 @@ void benchmark_t::run() noexcept
               << "\t- Scan succeeded: " << total_success_scan/ ((double)elapsed / 1000) << " ops/s"
               << std::endl;
 
-    // std::cout << "Per-thread breakdown (insert/read/update/remove/scan):\n";
-    // for (auto &s : local_stats) {
-    //   std::cout << "\t" << s.insert_count << "/" 
-    //             << s.read_count << "/" 
-    //             << s.update_count << "/" 
-    //             << s.remove_count << "/" 
-    //             << s.scan_count << " completed" << std::endl;
-    // }
+    std::cout << "Per-thread breakdown (insert/read/update/remove/scan):\n";
+    for (auto &s : local_stats) {
+      std::cout << "\t" << s.insert_count << "/" 
+                << s.read_count << "/" 
+                << s.update_count << "/" 
+                << s.remove_count << "/" 
+                << s.scan_count << " completed" << std::endl;
+    }
 
-    // for (auto &s : local_stats) {
-    //   std::cout << "\t" << s.success_insert_count << "/" 
-    //             << s.success_read_count << "/" 
-    //             << s.success_update_count << "/" 
-    //             << s.success_remove_count << "/" 
-    //             << s.success_scan_count << " succeeded" << std::endl;
-    // }
+    for (auto &s : local_stats) {
+      std::cout << "\t" << s.success_insert_count << "/" 
+                << s.success_read_count << "/" 
+                << s.success_update_count << "/" 
+                << s.success_remove_count << "/" 
+                << s.success_scan_count << " succeeded" << std::endl;
+    }
 
     if (opt_.enable_pcm)
     {
@@ -654,13 +656,13 @@ void benchmark_t::run() noexcept
                   << "\tNVM Writes (bytes): " << getBytesWrittenToPMM(*before_sstate, *after_sstate) << std::endl;
     }
 
-    // std::cout << "Samples:" << std::endl;
-    // std::adjacent_difference(global_stats.begin(), global_stats.end(), global_stats.begin(),
-    //                          [](const stats_t& x, const stats_t& y) {
-    //                              stats_t s;
-    //                              s.operation_count = x.operation_count - y.operation_count;
-    //                              return s;
-    //                          });
+    std::cout << "Samples:" << std::endl;
+    std::adjacent_difference(global_stats.begin(), global_stats.end(), global_stats.begin(),
+                             [](const stats_t& x, const stats_t& y) {
+                                 stats_t s;
+                                 s.operation_count = x.operation_count - y.operation_count;
+                                 return s;
+                             });
 
     for (auto s : global_stats)
         std::cout << "\t" << s.operation_count << std::endl;

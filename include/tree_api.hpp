@@ -133,6 +133,8 @@ public:
 
     virtual void tls_setup() {};
 
+    virtual void tls_reset() {};
+
     virtual void thread_start(int thread_id) {};
 
 };

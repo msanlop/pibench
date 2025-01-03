@@ -62,12 +62,18 @@ int main(int argc, char** argv)
             ("epoch_gc_threshold","Number of deletions before performing garbage collection",cxxopts::value<uint32_t>()->default_value(std::to_string(opt.epoch_gc_threshold)))
             ("enable_perf", "Enable perf", cxxopts::value<bool>()->default_value((opt.enable_perf ? "true" : "false")))
             ("perf_record_args", "Arguments to perf-record", cxxopts::value<std::string>()->default_value(""))
+            ("batch_size", "Combining size for OpTCL", cxxopts::value<uint32_t>()->default_value(std::to_string(0)))
             ("help", "Print help")
         ;
 
         options.parse_positional({"input"});
 
         auto result = options.parse(argc, argv);
+        if (result.count("batch_size"))
+        {
+            opt.batch_size = result["batch_size"].as<uint32_t>();            
+        }
+
         if (result.count("help"))
         {
             std::cout << options.help() << std::endl;
@@ -354,6 +360,7 @@ int main(int argc, char** argv)
         std::cout << "Error instantiating tree." << std::endl;
         exit(1);
     }
+    tree->set_combining_batch(opt.batch_size);
 
 #if defined(EPOCH_BASED_RECLAMATION)
     bench.setTree(tree);

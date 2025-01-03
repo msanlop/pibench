@@ -135,6 +135,9 @@ struct options_t
 
     /// Arguments to perf-record
     std::string perf_record_args = "";
+
+    /// OpTCL batch_size (could be extended for tclrw)
+    uint32_t batch_size = 0;
 };
 
 /**

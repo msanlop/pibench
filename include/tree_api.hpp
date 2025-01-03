@@ -137,6 +137,8 @@ public:
 
     virtual void thread_start(int thread_id) {};
 
+    virtual void set_combining_batch(unsigned int batch_size) {};
+
 };
 
 #endif
